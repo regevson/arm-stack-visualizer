@@ -1,6 +1,6 @@
 func:
 		MOV			r3, #3
-hexloop:
+loop:
 		MOV			r5, #4
 		MOV			r8, #1
 		MOV			r4, #9
@@ -12,5 +12,5 @@ hexloop:
     SWI     #0
     MOV     r4, r4
     SUBS    r3, r3, #1
-    BNE     hexloop
+    BNE     loop
 		SUB			sp, sp, #2
