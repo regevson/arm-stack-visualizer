@@ -6,87 +6,184 @@ import System.Environment (getArgs)
   -- Int -> offset (eventually added/subtracted from stack-pointer)
 -- ADD/SUB Int
   -- Int -> offset (eventually added/subtracted from stack-pointer)
-data Instruction = STMFD [String] Int | LDMFD Int | ADD Int | SUB Int | STACKNOTINVOLVED
-                     deriving (Show, Eq)
+data Instruction = STMFD String [String] | -- STMFD cond reglist
+                   LDMFD String [String] | -- LDMFD cond reglist
+                   ADD String Int String String String | -- ADD cond 'S?' dst op1 op2
+                   SUB String Int String String String | -- SUB cond 'S?' dst op1 op2
+                   B String String | -- B cond adr
+                   BL String String | -- BL cond adr
+                   MOV String String String | -- MOV cond dst src
+                   LBL String | -- LBL adr
+                   NOTRELEVANT -- not affecting stack
+                   deriving (Show, Eq)
 
-data Stack = Stack [String] Int deriving Show
+-- Stack [String] = Stack [frame]
+data Stack = Stack [String] deriving Show
 
 
 main = do
          args <- getArgs
+         putStrLn $ "\nStack visual of file: " ++ head args
          content <- readFile $ head args
-         let output = (create_instructions . map words . lines) content
-         let (Stack stack sp) = fill_stack output (Stack [] 0)
-         putStrLn $ "\nStack visual of file: " ++ head args ++ "\n"
-         --print $ show sp
-         putStrLn "               ___________" 
-         putStr $ unlines stack
+         let instructions = (map (to_instruction . words) . lines) content
+         let rel_inst = filter (\i -> i /= NOTRELEVANT) instructions
+         let (hist,banks) = collect rel_inst [] [first_bank]
+         let stack = stack_frames (reverse hist) (reverse banks) (Stack [])
+         let (Stack finished_stack) = insert_sp stack $ ldreg "r13" $ head banks
          putStrLn ""
+         putStrLn $ "              " ++ (head $ lines content) -- analyzed function
+         putStrLn "              ┌───────────┐" 
+         putStr $ unlines finished_stack
+         putStrLn "              └───────────┘" 
+         putStrLn "" where
+  first_bank = take 16 $ repeat 0 -- init bank
 
 
--- convert list of raw instructions into list of 'Instruction'-types
-create_instructions :: [[String]] -> [Instruction]
-create_instructions [] = error "empty program"
-create_instructions xs = filter (\ys -> ys /= STACKNOTINVOLVED) $ map (\ys -> to_instruction ys) xs
-
--- convert raw instruction (with stack involvement) into 'Instruction'-type
+-- convert arm-line to instruction-type
 to_instruction :: [String] -> Instruction
-to_instruction ("STMFD":"sp!,":reg) = STMFD (fst $ offset reg) (snd $ offset reg)
-to_instruction ("LDMFD":"sp!,":reg) = LDMFD (snd $ offset reg)
-to_instruction ("ADD":"sp,":"sp,":reg:[]) = ADD (snd $ offset [reg])
-to_instruction ("SUB":"sp,":"sp,":reg:[]) = SUB (snd $ offset [reg])
-to_instruction instruction = STACKNOTINVOLVED
+to_instruction ("STMFD":dst:src) = STMFD (cln dst) (expand src)
+to_instruction ("LDMFD":src:dst) = LDMFD (cln src) (expand dst)
+to_instruction (('A':'D':'D':'S':cond):dst:op1:op2:[]) = ADD cond 1 (cln dst) (cln op1) (cln op2)
+to_instruction (('A':'D':'D':cond):dst:op1:op2:[]) = ADD cond 0 (cln dst) (cln op1) (cln op2)
+to_instruction (('S':'U':'B':'S':cond):dst:op1:op2:[]) = SUB cond 1 (cln dst) (cln op1) (cln op2)
+to_instruction (('S':'U':'B':cond):dst:op1:op2:[]) = SUB cond 0 (cln dst) (cln op1) (cln op2)
+to_instruction (('B':'L':cond):adr:[]) = BL cond adr
+to_instruction (('B':cond):adr:[]) = B cond adr
+to_instruction (('M':'O':'V':cond):dst:src:[]) = MOV cond (cln dst) (cln src)
+-- to_instruction () = add all supported instructions here
+to_instruction (x:xs) = if last x == ':' then LBL (cln x) else NOTRELEVANT
+
+-- clean from special characters -> {,[,:,...
+cln str = filter (\c -> isAlpha c || isDigit c) str
+
+-- expand ["r4-r6","lr"] to ["r4","r5","r6","lr"]
+expand :: [String] -> [String]
+expand xs = concat $ map (extract_reg . (\s -> span (\c -> c /= '-') s)) xs where
+  extract_reg (reg, []) = [cln reg] -- if no '-' inside
+  extract_reg (from, to) = create_reg_list from to -- if '-' inside
+  create_reg_list from to = map ((\r -> 'r':r) . show) [(num from)..(num to)]
+
+-- extract numbers from String
+num :: String -> Int
+num reg = read $ filter (\c -> isDigit c) reg :: Int
+
+type Bank = [Int] -- list of 16 ints that represent the contents of the 16 registers
+
+-- for every instruction a new bank is created (based on the old one) and added to [Bank]
+-- Instructions to analyze -> analyzed Instructions -> created banks -> (anal. Instr., created banks)
+collect :: [Instruction] -> [Instruction] -> [Bank] -> ([Instruction],[Bank])
+collect [] hist bank = (hist, take len bank) where
+  len = (length bank) - 1 -- first added bank is trash
+
+collect (i@(STMFD "sp" reglist):is) hist banks@(b:_) = 
+          collect is (i:hist) $ streg "r13" (ldreg "r13" b + length reglist) b : banks
+
+collect (i@(LDMFD "sp" reglist):is) hist banks@(b:_) = 
+          collect is (i:hist) $ streg "r13" (ldreg "r13" b - length reglist) b : banks
+
+collect (i@(ADD cond _ dst op1 op2):is) hist banks@(b:_) = if execute cond hist banks -- check cond
+                                                           then exec -- if cond is fulfilled
+                                                           else collect is (i:hist) (b:banks) where
+  exec = collect is (i:hist) $ streg dst (ldreg op1 b + ldreg op2 b) b : banks
+
+collect (i@(SUB cond _ dst op1 op2):is) hist banks@(b:_) = if execute cond hist banks
+                                                           then exec
+                                                           else collect is (i:hist) (b:banks) where
+  exec = collect is (i:hist) $ (streg dst (ldreg op1 b - ldreg op2 b) b):banks
+
+collect (i@(BL cond adr):is) hist banks@(b:_) = if execute cond hist banks
+                                                then exec
+                                                else collect is (i:hist) (b:banks) where
+  exec = collect (unroll ++ is) hist banks
+  unroll = (LBL adr) : (reverse $ takeWhile (\i -> i /= (LBL adr)) $ i:hist)
+
+collect (i@(B cond adr):is) hist banks@(b:_) = if execute cond hist banks
+                                               then exec
+                                               else collect is (i:hist) (b:banks) where
+  exec = collect (unroll ++ is) (i:hist) (b:banks)
+  unroll = (LBL adr) : (reverse $ takeWhile (\i -> i /= (LBL adr)) $ i:hist)
+
+collect (i@(MOV cond dst src):is) hist banks@(b:_) = if execute cond hist banks
+                                                     then exec
+                                                     else collect is (i:hist) (b:banks) where
+  exec = collect is (i:hist) $ (streg dst (ldreg src b) b):banks
+
+collect (i@(LBL lbl):is) hist banks@(b:_) = collect is (i:hist) (b:banks)
+
+-- collect (i@():is) hist banks@(b:-) = add all supported instructions here
 
 
-{- 3 cases:
- - 1) #4
- - 2) r12 or lr
- - 3) r4-r12
--}
+-- change register in a Bank and return new Bank
+-- register to set -> value -> Bank -> new Bank
+streg :: String -> Int -> Bank -> Bank
+streg reg val bank = fst split ++ [val] ++ (tail . snd) split where
+  split = splitAt ((num . reg_transl) reg) bank
 
--- calc offset to stack resulting from values in @list
-offset :: [String] -> ([String], Int)
-offset list = foldl1 fol tuple_list where
-  tuple_list = map (form_tuple . (\s -> span (\c -> c /= '-') s)) list
-  fol = (\tuple1 -> (\tuple2 -> (fst tuple1 ++ fst tuple2, snd tuple1 + snd tuple2)))
+-- get value of register in a specific Bank
+-- if register is immediate -> return immediate
+ldreg :: String -> Bank -> Int
+ldreg reg_imm bank = case reg_transl reg_imm of
+                      ('r':i) -> bank !! (read i :: Int)
+                      imm -> read imm :: Int
 
--- form tuple ([String], Int) with [String] being the registers contributing to the offset
--- and Int being the offset
-form_tuple :: (String, String) -> ([String], Int)
-form_tuple (('#':imm),[]) = ([], read imm :: Int) -- 1)
-form_tuple (reg,[]) = ([filter (\c -> isAlpha c || isDigit c) reg], 1)  -- 2)
-form_tuple (from,to) = (reg_list, length reg_list) where -- 3)
-  reg_list = map ((\r -> 'r':r) . show) [(isolate_num from)..(isolate_num to)]
-  isolate_num str = read $ filter (\c -> isDigit c) str :: Int
+-- convert the 3 special registers to their 'r:number'-form
+reg_transl :: String -> String
+reg_transl "sp" = "r13"
+reg_transl "pc" = "r14"
+reg_transl "lr" = "r15"
+reg_transl reg = reg
+
+-- check if condition is fulfilled
+-- condition -> analyzed Instructions -> created Banks -> is_fulfilled
+execute :: String -> [Instruction] -> [Bank] -> Bool
+execute cond history banks = case cond of
+                               "" -> True -- no condition
+                               "NE" -> rewind history banks /= 0
+                               "E" -> rewind history banks == 0
+                            -- ... -> add conditions here
+                               otherwise -> error $ "condition not supported: " ++ cond
+
+-- search for most recent Instruction with an 'S' and return its computed value
+-- analyzed Instructions -> created banks -> relevant value
+rewind :: [Instruction] -> [Bank] -> Int
+rewind [] [] = error "no supported 'S-instruction' found"
+rewind ((ADD _ 1 dst _ _):hist) (b:banks) = ldreg dst b
+rewind ((SUB _ 1 dst _ _):hist) (b:banks) = ldreg dst b
+-- rewind ((...):hist) (b:banks) = add all Instructions capable of 'S' here
+rewind (h:hist) (b:banks) = rewind hist banks -- Instruction without 'S'
 
 
 
--- fill stack with Instructions
-fill_stack :: [Instruction] -> Stack -> Stack
-fill_stack [] stack = insert_sp stack
-fill_stack (x:xs) stack = fill_stack xs (draw_frames x stack)
 
--- Depending on the instruction new frame(s) on stack is (are) created + adjust stack-pointer
-draw_frames :: Instruction -> Stack -> Stack
-draw_frames (STMFD reg offs) (Stack stack sp) = Stack (place_frames reg offs stack sp) (sp+offs)
-draw_frames (LDMFD offs) (Stack stack sp) = Stack stack (sp-offs)
-draw_frames (ADD offs) (Stack stack sp) = Stack stack (sp+offs)
-draw_frames (SUB offs) (Stack stack sp) = Stack stack (sp-offs)
+-- stack frames onto Stack
+-- Instructions (top-to-bot) -> Banks (top-to-bot) -> empty Stack -> built Stack
+stack_frames :: [Instruction] -> [Bank] -> Stack -> Stack
+stack_frames [] [] stack = stack
+stack_frames ((STMFD "sp" reglist):is) (b:bank) (Stack stack) = stack_frames is bank new_stack where
+  new_stack = Stack (construct_frames reglist offs stack old_sp)
+  offs = new_sp - old_sp
+  new_sp = ldreg "r13" b
+  old_sp = new_sp - (length reglist)
+stack_frames (_:is) (b:bank) stack = stack_frames is bank stack -- no frame added
 
--- insert registers (@reg) into the stack after stack-pointer
-place_frames :: [String] -> Int -> [String] -> Int -> [String]
-place_frames reg offs stack sp = (fst sp_split) ++ format_frames reg ++ (drop offs (snd sp_split)) 
+
+-- construct frames from @reglist
+-- reglist -> frames to add -> stack -> old_sp -> new stack
+construct_frames :: [String] -> Int -> [String] -> Int -> [String]
+construct_frames reg offs stack sp = (fst sp_split) ++ format reg ++ (drop offs (snd sp_split)) 
   where
   sp_split = splitAt sp stack
-  format_frames xs = map format_frame xs
+  format xs = map format_frame xs
   format_frame frame_content
     | length frame_content < 3 = format_frame $ frame_content ++ " "
     | otherwise = "              |    " ++ frame_content ++ "    |"
 
 -- insert stack-pointer-highlighting into stack
-insert_sp :: Stack -> Stack
-insert_sp (Stack stack sp) = Stack (first ++ [head second ++ " sp"] ++ tail second) sp where
+insert_sp :: Stack -> Int -> Stack
+insert_sp (Stack stack) sp = Stack (first ++ [head second ++ " » sp (FD)"] ++ tail second) where
   spl = splitAt (sp-1) stack
   first = fst spl
   second = snd spl
+
+
 
